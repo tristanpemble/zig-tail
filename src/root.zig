@@ -1,14 +1,16 @@
-test {
-    const Packet = extern struct {
-        host_len: usize,
-        tail: Tail(@This(), struct {
-            host: TailSlice(u8, .host_len),
-            buf_lens: usize,
-            read_buf: TailSlice(u8, .buf_lens),
-            write_buf: TailSlice(u8, .buf_lens),
-        }),
-    };
+const Packet = extern struct {
+    host_len: usize,
+    tail: Tail,
 
+    const Tail = TailStruct(@This(), struct {
+        host: TailSlice(u8, .host_len),
+        buf_lens: usize,
+        read_buf: TailSlice(u8, .buf_lens),
+        write_buf: TailSlice(u8, .buf_lens),
+    });
+};
+
+test {
     var buffer: [128]u8 align(@alignOf(Packet)) = @splat(0);
 
     var stream = std.io.fixedBufferStream(&buffer);
@@ -24,7 +26,7 @@ test {
     try std.testing.expectEqual(16, packet.tail.get(.write_buf).len);
 }
 
-pub fn Tail(Parent: type, Layout: type) type {
+pub fn TailStruct(Parent: type, Layout: type) type {
     return struct {
         const IsTail = {};
         const tail_field_name = blk: {
@@ -41,6 +43,11 @@ pub fn Tail(Parent: type, Layout: type) type {
                 field = f.name;
             }
             if (err.len > 0) @compileError(err);
+            for (@typeInfo(Layout).@"struct".fields) |f| {
+                if (@hasField(Parent, f.name)) {
+                    @compileError("Field '" ++ f.name ++ "' exists in both parent type '" ++ @typeName(Parent) ++ "' and its '" ++ field.? ++ "' layout. All field names need to be unique between parent type and tail layout.");
+                }
+            }
             break :blk field.?;
         };
 
