@@ -1,14 +1,15 @@
-const Packet = extern struct {
-    host_len: usize,
-    tail: Tail(@This(), struct {
-        host: TailSlice(u8, .{ .len = .host_len }),
-        buf_lens: usize,
-        read_buf: TailSlice(u8, .{ .len = .buf_lens }),
-        write_buf: TailSlice(u8, .{ .len = .buf_lens }),
-    }),
-};
-
 test {
+    const Packet = extern struct {
+        host_len: usize,
+        tail: Tail(@This(), struct {
+            host: TailSlice(u8, .{ .header = .host_len }),
+            buf_lens: usize,
+            read_buf: TailSlice(u8, .{ .tail = .buf_lens }),
+            write_buf: TailSlice(u8, .{ .tail = .buf_lens }),
+            butts: TailSlice(u8, .external),
+        }),
+    };
+
     var buffer: [128]u8 align(@alignOf(Packet)) = @splat(0);
 
     var stream = std.io.fixedBufferStream(&buffer);
@@ -45,39 +46,28 @@ pub fn Tail(Parent: type, Layout: type) type {
             @memcpy(dest, value);
         }
 
-        /// Returns the name of the field that holds the length of the given tail slice
-        fn getLenFieldName(comptime field_name: []const u8) []const u8 {
-            return @tagName(@FieldType(Layout, field_name).opts.len);
+        /// Returns the `LengthLocation`, indicating where the length of the given tail slice is held.
+        fn getLenLocation(comptime field_name: []const u8) LengthLocation {
+            return @FieldType(Layout, field_name).len;
         }
 
-        /// Returns .parent or .tail indicating where the length of the given tail slice is held
-        fn getLenLocation(comptime field_name: []const u8) enum { parent, tail } {
-            const len_field = comptime getLenFieldName(field_name);
-            return if (comptime @hasField(Parent, len_field))
-                .parent
-            else if (comptime @hasField(Layout, len_field))
-                .tail
-            else
-                @compileError("'" ++ len_field ++ "', the length field for '" ++ field_name ++ "', does not exist on either '" ++ @typeName(Parent) ++ "' or its tail.");
-        }
-
-        /// Returns the integer type used for storing the length of the given tail slice
+        /// Returns the integer type used for storing the length of the given tail slice.
         fn LenOf(comptime field_name: []const u8) type {
-            const len_field = comptime getLenFieldName(field_name);
-            return switch (getLenLocation(field_name)) {
-                .parent => @FieldType(Parent, len_field),
-                .tail => @FieldType(Layout, len_field),
+            return switch (comptime getLenLocation(field_name)) {
+                .external => @panic("TODO"),
+                .header => |tag| @FieldType(Parent, @tagName(tag)),
+                .tail => |tag| @FieldType(Layout, @tagName(tag)),
             };
         }
 
-        /// Returns the length of the given tail slice
+        /// Returns the length of the given tail slice.
         fn lenOf(parent: *const Parent, comptime field_name: []const u8) LenOf(field_name) {
-            const len_field = comptime getLenFieldName(field_name);
             return switch (comptime getLenLocation(field_name)) {
-                .parent => @field(parent, len_field),
-                .tail => {
+                .external => @panic("TODO"),
+                .header => |tag| @field(parent, @tagName(tag)),
+                .tail => |tag| {
                     const bytes: [*]align(@alignOf(Parent)) const u8 = @ptrCast(parent);
-                    const offset = offsetOf(parent, len_field);
+                    const offset = offsetOf(parent, @tagName(tag));
                     const size = @sizeOf(LenOf(field_name));
                     const len: *const LenOf(field_name) = @ptrCast(@alignCast(bytes[offset..][0..size]));
                     return len.*;
@@ -154,17 +144,19 @@ pub fn TailOf(comptime T: type) type {
 
 const IsTailSlice = struct {};
 
-pub fn TailSlice(comptime T: type, comptime opts_: TailSliceOpts) type {
+pub fn TailSlice(comptime T: type, comptime length_location: LengthLocation) type {
     return struct {
         const is_tail_slice = IsTailSlice{};
 
         pub const Element = T;
-        pub const opts = opts_;
+        pub const len = length_location;
     };
 }
 
-pub const TailSliceOpts = struct {
-    len: @Type(.enum_literal),
+pub const LengthLocation = union(enum) {
+    external: void,
+    header: @Type(.enum_literal),
+    tail: @Type(.enum_literal),
 };
 
 pub fn isTailSlice(comptime T: type) bool {
