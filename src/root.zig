@@ -1,13 +1,11 @@
 const Packet = extern struct {
     host_len: usize,
-    tail: Tail,
-
-    const Tail = TailStruct(@This(), struct {
-        host: TailSlice(u8, .host_len),
+    tail: Tail(@This(), struct {
+        host: TailSlice(u8, .{ .len = .host_len }),
         buf_lens: usize,
-        read_buf: TailSlice(u8, .buf_lens),
-        write_buf: TailSlice(u8, .buf_lens),
-    });
+        read_buf: TailSlice(u8, .{ .len = .buf_lens }),
+        write_buf: TailSlice(u8, .{ .len = .buf_lens }),
+    }),
 };
 
 test {
@@ -26,13 +24,14 @@ test {
     try std.testing.expectEqual(16, packet.tail.get(.write_buf).len);
 }
 
-pub fn TailStruct(Parent: type, Layout: type) type {
+const IsTail = struct {};
+
+pub fn Tail(Parent: type, Layout: type) type {
     return struct {
-        const IsTail = {};
-        const tail_field_name = @tagName(getTailField(Parent) orelse @compileError("'" ++ @typeName(Parent) ++ "' does not have a tail field"));
+        const is_tail = IsTail{};
 
         pub fn get(self: *@This(), comptime field: FieldEnum(Layout)) []@FieldType(Layout, @tagName(field)).Element {
-            const parent: *Parent = @alignCast(@fieldParentPtr(tail_field_name, self));
+            const parent: *Parent = @alignCast(@fieldParentPtr(getTailFieldName(Parent), self));
             const bytes: [*]align(@alignOf(Parent)) u8 = @ptrCast(parent);
             const offset = offsetOf(parent, @tagName(field));
             const size = sizeOf(parent, @tagName(field));
@@ -46,27 +45,47 @@ pub fn TailStruct(Parent: type, Layout: type) type {
             @memcpy(dest, value);
         }
 
-        fn LenOf(comptime field_name: []const u8) type {
-            const len_field = @tagName(@FieldType(Layout, field_name).len_field);
+        /// Returns the name of the field that holds the length of the given tail slice
+        fn getLenFieldName(comptime field_name: []const u8) []const u8 {
+            return @tagName(@FieldType(Layout, field_name).opts.len);
+        }
+
+        /// Returns .parent or .tail indicating where the length of the given tail slice is held
+        fn getLenLocation(comptime field_name: []const u8) enum { parent, tail } {
+            const len_field = comptime getLenFieldName(field_name);
             return if (comptime @hasField(Parent, len_field))
-                @FieldType(Parent, len_field)
+                .parent
             else if (comptime @hasField(Layout, len_field))
-                @FieldType(Layout, len_field)
+                .tail
             else
-                @compileError("'" ++ len_field ++ "', the length field of '" ++ field_name ++ "', does not exist on either '" ++ @typeName(Parent) ++ "' or the layout struct.");
+                @compileError("'" ++ len_field ++ "', the length field for '" ++ field_name ++ "', does not exist on either '" ++ @typeName(Parent) ++ "' or its tail.");
         }
 
+        /// Returns the integer type used for storing the length of the given tail slice
+        fn LenOf(comptime field_name: []const u8) type {
+            const len_field = comptime getLenFieldName(field_name);
+            return switch (getLenLocation(field_name)) {
+                .parent => @FieldType(Parent, len_field),
+                .tail => @FieldType(Layout, len_field),
+            };
+        }
+
+        /// Returns the length of the given tail slice
         fn lenOf(parent: *const Parent, comptime field_name: []const u8) LenOf(field_name) {
-            const len_field = @tagName(@FieldType(Layout, field_name).len_field);
-            return if (comptime @hasField(Parent, len_field))
-                @field(parent, len_field)
-            else if (comptime @hasField(Layout, len_field)) blk: {
-                const offset = offsetOf(parent, len_field);
-                const ptr: *LenOf(field_name) = @ptrFromInt(@intFromPtr(parent) + offset);
-                break :blk ptr.*;
-            } else @compileError("'" ++ len_field ++ "', the length field of '" ++ field_name ++ "', does not exist on either '" ++ @typeName(Parent) ++ "' or the layout struct.");
+            const len_field = comptime getLenFieldName(field_name);
+            return switch (comptime getLenLocation(field_name)) {
+                .parent => @field(parent, len_field),
+                .tail => {
+                    const bytes: [*]align(@alignOf(Parent)) const u8 = @ptrCast(parent);
+                    const offset = offsetOf(parent, len_field);
+                    const size = @sizeOf(LenOf(field_name));
+                    const len: *const LenOf(field_name) = @ptrCast(@alignCast(bytes[offset..][0..size]));
+                    return len.*;
+                },
+            };
         }
 
+        /// Returns the size of the given tail field. For tail slices, calculates the size with the length of the slice.
         fn sizeOf(parent: *const Parent, comptime field_name: []const u8) usize {
             const Field = @FieldType(Layout, field_name);
             if (comptime isTailSlice(Field)) {
@@ -77,6 +96,7 @@ pub fn TailStruct(Parent: type, Layout: type) type {
             }
         }
 
+        /// Returns the offset of the given tail field.
         fn offsetOf(parent: *const Parent, comptime field_name: []const u8) usize {
             var offset: usize = @sizeOf(Parent);
             inline for (@typeInfo(Layout).@"struct".fields) |f| {
@@ -92,46 +112,65 @@ pub fn TailStruct(Parent: type, Layout: type) type {
     };
 }
 
+fn isTail(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and
+        @hasDecl(T, "is_tail") and
+        @TypeOf(T.is_tail) == IsTail;
+}
+
 pub fn hasTail(comptime T: type) bool {
-    return getTailField(T) != null;
-}
-
-pub fn getTail(comptime T: type, val: *T) blk: {
-    const field = getTailField() orelse @compileError("'" ++ @typeName(T) ++ "' is not a tail type");
-    break :blk *@FieldType(T, @tagName(field));
-} {
-    return @field(val, @tagName(getTailField(T)).?);
-}
-
-pub fn getTailField(comptime T: type) ?FieldEnum(T) {
-    var field: ?[]const u8 = null;
-    var err: []const u8 = "";
-    for (@typeInfo(T).@"struct".fields) |f| {
-        if (@typeInfo(f.type) != .@"struct" or !@hasDecl(f.type, "IsTail")) continue;
-        if (field != null) {
-            if (err.len == 0) {
-                err = "multiple tail types on " ++ @typeName(T) ++ ", found: " ++ field.?;
-            }
-            err = err ++ ", " ++ f.name;
-        }
-        field = f.name;
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        if (isTail(f.type)) return true;
     }
-    if (err.len > 0) @compileError(err);
-    return if (field) |name| @field(FieldEnum(T), name) else null;
 }
 
-pub fn TailSlice(T: type, field: @Type(.enum_literal)) type {
+pub fn getTailFieldName(comptime T: type) []const u8 {
+    comptime {
+        if (!hasTail(T)) @compileError("'" ++ @typeName(T) ++ "' is not a tail type");
+        var field: ?[]const u8 = null;
+        var err: []const u8 = "";
+        for (@typeInfo(T).@"struct".fields) |f| {
+            if (!isTail(f.type)) continue;
+            if (field != null) {
+                if (err.len == 0) {
+                    err = "multiple tail types on " ++ @typeName(T) ++ ", found: " ++ field.?;
+                }
+                err = err ++ ", " ++ f.name;
+            }
+            field = f.name;
+        }
+        if (err.len > 0) @compileError(err);
+        return field.?;
+    }
+}
+
+pub fn getTail(comptime T: type, parent: *T) *TailOf(T) {
+    return @field(parent, getTailFieldName(T));
+}
+
+pub fn TailOf(comptime T: type) type {
+    return @FieldType(T, getTailFieldName(T));
+}
+
+const IsTailSlice = struct {};
+
+pub fn TailSlice(comptime T: type, comptime opts_: TailSliceOpts) type {
     return struct {
-        const is_tail_slice = {};
+        const is_tail_slice = IsTailSlice{};
 
         pub const Element = T;
-        pub const len_field = field;
+        pub const opts = opts_;
     };
 }
 
+pub const TailSliceOpts = struct {
+    len: @Type(.enum_literal),
+};
+
 pub fn isTailSlice(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and
-        @hasDecl(T, "is_tail_slice");
+        @hasDecl(T, "is_tail_slice") and
+        @TypeOf(T.is_tail_slice) == IsTailSlice;
 }
 
 const native = builtin.cpu.arch.endian();
