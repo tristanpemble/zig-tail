@@ -29,27 +29,7 @@ test {
 pub fn TailStruct(Parent: type, Layout: type) type {
     return struct {
         const IsTail = {};
-        const tail_field_name = blk: {
-            var field: ?[]const u8 = null;
-            var err: []const u8 = "";
-            for (@typeInfo(Parent).@"struct".fields) |f| {
-                if (@typeInfo(f.type) != .@"struct" or !@hasDecl(f.type, "IsTail")) continue;
-                if (field != null) {
-                    if (err.len == 0) {
-                        err = "multiple tail types on " ++ @typeName(Parent) ++ ", found: " ++ field.?;
-                    }
-                    err = err ++ ", " ++ f.name;
-                }
-                field = f.name;
-            }
-            if (err.len > 0) @compileError(err);
-            for (@typeInfo(Layout).@"struct".fields) |f| {
-                if (@hasField(Parent, f.name)) {
-                    @compileError("Field '" ++ f.name ++ "' exists in both parent type '" ++ @typeName(Parent) ++ "' and its '" ++ field.? ++ "' layout. All field names need to be unique between parent type and tail layout.");
-                }
-            }
-            break :blk field.?;
-        };
+        const tail_field_name = @tagName(getTailField(Parent) orelse @compileError("'" ++ @typeName(Parent) ++ "' does not have a tail field"));
 
         pub fn get(self: *@This(), comptime field: FieldEnum(Layout)) []@FieldType(Layout, @tagName(field)).Element {
             const parent: *Parent = @alignCast(@fieldParentPtr(tail_field_name, self));
@@ -112,6 +92,34 @@ pub fn TailStruct(Parent: type, Layout: type) type {
     };
 }
 
+pub fn hasTail(comptime T: type) bool {
+    return getTailField(T) != null;
+}
+
+pub fn getTail(comptime T: type, val: *T) blk: {
+    const field = getTailField() orelse @compileError("'" ++ @typeName(T) ++ "' is not a tail type");
+    break :blk *@FieldType(T, @tagName(field));
+} {
+    return @field(val, @tagName(getTailField(T)).?);
+}
+
+pub fn getTailField(comptime T: type) ?FieldEnum(T) {
+    var field: ?[]const u8 = null;
+    var err: []const u8 = "";
+    for (@typeInfo(T).@"struct".fields) |f| {
+        if (@typeInfo(f.type) != .@"struct" or !@hasDecl(f.type, "IsTail")) continue;
+        if (field != null) {
+            if (err.len == 0) {
+                err = "multiple tail types on " ++ @typeName(T) ++ ", found: " ++ field.?;
+            }
+            err = err ++ ", " ++ f.name;
+        }
+        field = f.name;
+    }
+    if (err.len > 0) @compileError(err);
+    return if (field) |name| @field(FieldEnum(T), name) else null;
+}
+
 pub fn TailSlice(T: type, field: @Type(.enum_literal)) type {
     return struct {
         const is_tail_slice = {};
@@ -129,6 +137,7 @@ pub fn isTailSlice(comptime T: type) bool {
 const native = builtin.cpu.arch.endian();
 
 const std = @import("std");
+const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const FieldEnum = std.meta.FieldEnum;
 const FieldInfo = std.builtin.Type.FieldInfo;
